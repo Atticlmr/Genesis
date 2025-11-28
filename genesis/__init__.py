@@ -21,6 +21,11 @@ except ImportError as e:
     raise ImportError(
         "'torch' module not available. Please install pytorch manually: https://pytorch.org/get-started/locally/"
     ) from e
+if tuple(map(int, torch.__version__.split(".")[:2])) < (2, 8):
+    raise ImportError(
+        "'torch<2.8.0' is not supported. Please update pytorch manually: https://pytorch.org/get-started/locally/"
+    )
+
 import numpy as np
 
 from .constants import GS_ARCH, TI_ARCH
@@ -171,9 +176,9 @@ def init(
     tc_int = torch.int32
 
     # Bool
-    # Note that `ti.u1` is broken on Apple Metal and output garbage.
+    # Note that `ti.u1` is broken on Apple Metal and Vulkan.
     global ti_bool, np_bool, tc_bool
-    if backend == gs_backend.metal:
+    if backend in (gs_backend.metal, gs_backend.vulkan):
         ti_bool = ti.i32
         np_bool = np.int32
         tc_bool = torch.int32
@@ -406,7 +411,7 @@ with open(os.devnull, "w") as stderr, redirect_libc_stderr(stderr):
         from pygel3d import graph, hmesh
     except OSError as e:
         # Import may fail because of missing system dependencies (libGLU.so.1).
-        # This is not blocking because it is only an issue for hybrig entities.
+        # This is not blocking because it is only an issue for hybrid entities.
         pass
 
     try:

@@ -14,15 +14,7 @@ from genesis.engine.entities.base_entity import Entity
 from genesis.engine.states.solvers import RigidSolverState
 from genesis.options.solvers import RigidOptions
 from genesis.utils import linalg as lu
-from genesis.utils.misc import (
-    ALLOCATE_TENSOR_WARNING,
-    DeprecationError,
-    ti_to_torch,
-    ti_to_numpy,
-    ti_to_python,
-    indices_to_mask,
-    _get_ti_metadata,
-)
+from genesis.utils.misc import ALLOCATE_TENSOR_WARNING, DeprecationError, ti_to_torch, ti_to_numpy, indices_to_mask
 from genesis.utils.sdf_decomp import SDF
 
 from ..base_solver import Solver
@@ -131,7 +123,6 @@ class RigidSolver(Solver):
         self._options = options
 
         self._cur_step = -1
-        self._links_state_cache = {}
 
         self.qpos: ti.Template | ti.types.NDArray | None = None
 
@@ -819,37 +810,9 @@ class RigidSolver(Solver):
             else:
                 self.constraint_solver = ConstraintSolver(self)
 
-    def _get_links_data(
-        self,
-        field_name: str,
-        row_mask: slice | int | range | list | torch.Tensor | np.ndarray | None = None,
-        col_mask: slice | int | range | list | torch.Tensor | np.ndarray | None = None,
-        keepdim=True,
-        *,
-        to_torch=True,
-    ):
-        links_state_py = self._links_state_cache.setdefault((to_torch,), {})
-
-        field = getattr(self.links_state, field_name)
-        tensor = links_state_py.get(field_name)
-        if tensor is None:
-            tensor = links_state_py[field_name] = ti_to_python(field, transpose=True, to_torch=to_torch)
-
-        ti_data_meta = _get_ti_metadata(field)
-        if len(ti_data_meta.shape) < 2:
-            if row_mask is not None and col_mask is not None:
-                gs.raise_exception("Cannot specify both row and colum masks for tensor with 1D batch.")
-            mask = indices_to_mask(row_mask if col_mask is None else col_mask, keepdim=keepdim, to_torch=to_torch)
-        else:
-            mask = indices_to_mask(row_mask, col_mask, keepdim=keepdim, to_torch=to_torch)
-
-        return tensor[mask]
-
     def substep(self):
         # from genesis.utils.tools import create_timer
         from genesis.engine.couplers import SAPCoupler
-
-        self._links_state_cache.clear()
 
         kernel_step_1(
             links_state=self.links_state,
@@ -912,6 +875,8 @@ class RigidSolver(Solver):
                     f"Exceeding max number of contact pairs ({max_contact_pairs}). Please increase the value of "
                     "RigidSolver's option 'max_collision_pairs'."
                 )
+            case 3:
+                gs.raise_exception("Invalid accelerations causing 'nan'. Please decrease Rigid simulation timestep.")
 
     def _kernel_detect_collision(self):
         self.collider.reset(cache_only=True)
@@ -1232,22 +1197,10 @@ class RigidSolver(Solver):
         if self.is_active:
             state = RigidSolverState(self._scene)
 
-            # qpos: ti.types.ndarray(),
-            # vel: ti.types.ndarray(),
-            # links_pos: ti.types.ndarray(),
-            # links_quat: ti.types.ndarray(),
-            # i_pos_shift: ti.types.ndarray(),
-            # mass_shift: ti.types.ndarray(),
-            # friction_ratio: ti.types.ndarray(),
-            # links_state: array_class.LinksState,
-            # dofs_state: array_class.DofsState,
-            # geoms_state: array_class.GeomsState,
-            # rigid_global_info: array_class.RigidGlobalInfo,
-            # static_rigid_sim_config: ti.template(),
-
             kernel_get_state(
                 qpos=state.qpos,
                 vel=state.dofs_vel,
+                acc=state.dofs_acc,
                 links_pos=state.links_pos,
                 links_quat=state.links_quat,
                 i_pos_shift=state.i_pos_shift,
@@ -1269,6 +1222,7 @@ class RigidSolver(Solver):
             kernel_set_state(
                 qpos=state.qpos,
                 dofs_vel=state.dofs_vel,
+                dofs_acc=state.dofs_acc,
                 links_pos=state.links_pos,
                 links_quat=state.links_quat,
                 i_pos_shift=state.i_pos_shift,
@@ -1301,7 +1255,6 @@ class RigidSolver(Solver):
             self.collider.clear(envs_idx)
             if self.constraint_solver is not None:
                 self.constraint_solver.reset(envs_idx)
-            self._links_state_cache.clear()
             self._cur_step = -1
 
     def process_input(self, in_backward=False):
@@ -1541,7 +1494,6 @@ class RigidSolver(Solver):
             static_rigid_sim_config=self._static_rigid_sim_config,
         )
 
-        self._links_state_cache.clear()
         kernel_forward_kinematics_links_geoms(
             envs_idx,
             links_state=self.links_state,
@@ -1590,7 +1542,6 @@ class RigidSolver(Solver):
             static_rigid_sim_config=self._static_rigid_sim_config,
         )
 
-        self._links_state_cache.clear()
         kernel_forward_kinematics_links_geoms(
             envs_idx,
             links_state=self.links_state,
@@ -1668,7 +1619,6 @@ class RigidSolver(Solver):
                 qpos = qpos.unsqueeze(0)
             kernel_set_qpos(qpos, qs_idx, envs_idx, self._rigid_global_info, self._static_rigid_sim_config)
 
-        self._links_state_cache.clear()
         self.collider.reset(envs_idx, cache_only=True)
         if not isinstance(envs_idx, torch.Tensor):
             envs_idx = self._scene._sanitize_envs_idx(envs_idx, unsafe=unsafe)
@@ -1788,6 +1738,14 @@ class RigidSolver(Solver):
         )
 
     def _set_dofs_info(self, tensor_list, dofs_idx, name, envs_idx=None, *, unsafe=False):
+        if gs.use_zerocopy and name in {"kp", "kv", "force_range", "stiffness", "damping", "frictionloss", "limit"}:
+            mask = indices_to_mask(*((envs_idx, dofs_idx) if self._options.batch_dofs_info else (dofs_idx,)))
+            data = ti_to_torch(getattr(self.dofs_info, name), transpose=True, copy=False)
+            num_values = len(tensor_list)
+            for j, mask_j in enumerate(((*mask, ..., j) for j in range(num_values)) if num_values > 1 else (mask,)):
+                data[mask_j] = torch.as_tensor(tensor_list[j], dtype=gs.tc_float, device=gs.device)
+            return
+
         tensor_list = list(tensor_list)
         for j, tensor in enumerate(tensor_list):
             tensor_list[j], dofs_idx, envs_idx_ = self._sanitize_1D_io_variables(
@@ -1814,7 +1772,7 @@ class RigidSolver(Solver):
         elif name == "armature":
             kernel_set_dofs_armature(tensor_list[0], dofs_idx, envs_idx_, self.dofs_info, self._static_rigid_sim_config)
             qs_idx = torch.arange(self.n_qs, dtype=gs.tc_int, device=gs.device)
-            qpos_cur = self.get_qpos(envs_idx=envs_idx, qs_idx=qs_idx, unsafe=unsafe)
+            qpos_cur = self.get_qpos(qs_idx=qs_idx, envs_idx=envs_idx, unsafe=unsafe)
             self._init_invweight_and_meaninertia(envs_idx=envs_idx, force_update=True, unsafe=unsafe)
             self.set_qpos(qpos_cur, qs_idx=qs_idx, envs_idx=envs_idx, unsafe=unsafe)
         elif name == "damping":
@@ -1877,7 +1835,6 @@ class RigidSolver(Solver):
                     velocity = velocity.unsqueeze(0)
                 kernel_set_dofs_velocity(velocity, dofs_idx, envs_idx, self.dofs_state, self._static_rigid_sim_config)
 
-        self._links_state_cache.clear()
         if not skip_forward:
             kernel_forward_velocity(
                 envs_idx,
@@ -1908,7 +1865,6 @@ class RigidSolver(Solver):
             self._static_rigid_sim_config,
         )
 
-        self._links_state_cache.clear()
         self.collider.reset(envs_idx, cache_only=True)
         self.collider.clear(envs_idx)
         if self.constraint_solver is not None:
@@ -2055,20 +2011,20 @@ class RigidSolver(Solver):
     ):
         ref = self._convert_ref_to_idx(ref)
         if ref == 0:
-            tensor = self._get_links_data("root_COM", envs_idx, links_idx, to_torch=to_torch)
+            tensor = ti_to_torch(self.links_state.root_COM, envs_idx, links_idx, transpose=True)
         elif ref == 1:
-            i_pos = self._get_links_data("i_pos", envs_idx, links_idx, to_torch=to_torch)
-            root_COM = self._get_links_data("root_COM", envs_idx, links_idx, to_torch=to_torch)
+            i_pos = ti_to_torch(self.links_state.i_pos, envs_idx, links_idx, transpose=True)
+            root_COM = ti_to_torch(self.links_state.root_COM, envs_idx, links_idx, transpose=True)
             tensor = i_pos + root_COM
         elif ref == 2:
-            tensor = self._get_links_data("pos", envs_idx, links_idx, to_torch=to_torch)
+            tensor = ti_to_torch(self.links_state.pos, envs_idx, links_idx, transpose=True)
         else:
             gs.raise_exception("'ref' must be either 'link_origin', 'link_com', or 'root_com'.")
 
         return tensor[0] if self.n_envs == 0 else tensor
 
     def get_links_quat(self, links_idx=None, envs_idx=None, *, to_torch=True, unsafe=False):
-        tensor = self._get_links_data("quat", envs_idx, links_idx, to_torch=to_torch)
+        tensor = ti_to_torch(self.links_state.quat, envs_idx, links_idx, transpose=True)
         return tensor[0] if self.n_envs == 0 else tensor
 
     def get_links_vel(
@@ -2103,7 +2059,7 @@ class RigidSolver(Solver):
         return _tensor
 
     def get_links_ang(self, links_idx=None, envs_idx=None, *, to_torch=True, unsafe=False):
-        tensor = self._get_links_data("cd_ang", envs_idx, links_idx, to_torch=to_torch)
+        tensor = ti_to_torch(self.links_state.cd_ang, envs_idx, links_idx, transpose=True)
         return tensor[0] if self.n_envs == 0 else tensor
 
     def get_links_acc(self, links_idx=None, envs_idx=None, *, unsafe=False):
@@ -2121,7 +2077,7 @@ class RigidSolver(Solver):
         return _tensor
 
     def get_links_acc_ang(self, links_idx=None, envs_idx=None, *, to_torch=True, unsafe=False):
-        tensor = self._get_links_data("cacc_ang", envs_idx, links_idx, to_torch=to_torch)
+        tensor = ti_to_torch(self.links_state.cacc_ang, envs_idx, links_idx, transpose=True)
         return tensor[0] if self.n_envs == 0 else tensor
 
     def get_links_root_COM(self, links_idx=None, envs_idx=None, *, to_torch=True, unsafe=False):
@@ -2131,15 +2087,15 @@ class RigidSolver(Solver):
         This corresponds to the global COM of each entity, assuming a single-rooted structure - that is, as long as no
         two successive links are connected by a free-floating joint (ie a joint that allows all 6 degrees of freedom).
         """
-        tensor = self._get_links_data("root_COM", envs_idx, links_idx, to_torch=to_torch)
+        tensor = ti_to_torch(self.links_state.root_COM, envs_idx, links_idx, transpose=True)
         return tensor[0] if self.n_envs == 0 else tensor
 
     def get_links_mass_shift(self, links_idx=None, envs_idx=None, *, to_torch=True, unsafe=False):
-        tensor = self._get_links_data("mass_shift", envs_idx, links_idx, to_torch=to_torch)
+        tensor = ti_to_torch(self.links_state.mass_shift, envs_idx, links_idx, transpose=True)
         return tensor[0] if self.n_envs == 0 else tensor
 
     def get_links_COM_shift(self, links_idx=None, envs_idx=None, *, to_torch=True, unsafe=False):
-        tensor = self._get_links_data("i_pos_shift", envs_idx, links_idx, to_torch=to_torch)
+        tensor = ti_to_torch(self.links_state.i_pos_shift, envs_idx, links_idx, transpose=True)
         return tensor[0] if self.n_envs == 0 else tensor
 
     def get_links_inertial_mass(self, links_idx=None, envs_idx=None, *, unsafe=False):
@@ -5577,50 +5533,135 @@ def func_integrate(
     _B = dofs_state.ctrl_mode.shape[1]
     n_dofs = dofs_state.ctrl_mode.shape[0]
     n_links = links_info.root_idx.shape[0]
+
     if ti.static(static_rigid_sim_config.use_hibernation):
         ti.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
         for i_b in range(_B):
+            is_valid = True
             for i_d_ in range(rigid_global_info.n_awake_dofs[i_b]):
                 i_d = rigid_global_info.awake_dofs[i_d_, i_b]
-                dofs_state.vel[i_d, i_b] = (
-                    dofs_state.vel[i_d, i_b] + dofs_state.acc[i_d, i_b] * rigid_global_info.substep_dt[None]
-                )
+                if ti.math.isnan(dofs_state.acc[i_d, i_b]):
+                    is_valid = False
 
+            if is_valid:
+                for i_d_ in range(rigid_global_info.n_awake_dofs[i_b]):
+                    i_d = rigid_global_info.awake_dofs[i_d_, i_b]
+                    dofs_state.vel[i_d, i_b] = (
+                        dofs_state.vel[i_d, i_b] + dofs_state.acc[i_d, i_b] * rigid_global_info.substep_dt[None]
+                    )
+
+                for i_l_ in range(rigid_global_info.n_awake_links[i_b]):
+                    i_l = rigid_global_info.awake_links[i_l_, i_b]
+                    I_l = [i_l, i_b] if ti.static(static_rigid_sim_config.batch_links_info) else i_l
+
+                    for i_j in range(links_info.joint_start[I_l], links_info.joint_end[I_l]):
+                        I_j = [i_j, i_b] if ti.static(static_rigid_sim_config.batch_joints_info) else i_j
+                        dof_start = joints_info.dof_start[I_j]
+                        q_start = joints_info.q_start[I_j]
+                        q_end = joints_info.q_end[I_j]
+
+                        joint_type = joints_info.type[I_j]
+
+                        if joint_type == gs.JOINT_TYPE.FREE:
+                            rot = ti.Vector(
+                                [
+                                    rigid_global_info.qpos[q_start + 3, i_b],
+                                    rigid_global_info.qpos[q_start + 4, i_b],
+                                    rigid_global_info.qpos[q_start + 5, i_b],
+                                    rigid_global_info.qpos[q_start + 6, i_b],
+                                ]
+                            )
+                            ang = (
+                                ti.Vector(
+                                    [
+                                        dofs_state.vel[dof_start + 3, i_b],
+                                        dofs_state.vel[dof_start + 4, i_b],
+                                        dofs_state.vel[dof_start + 5, i_b],
+                                    ]
+                                )
+                                * rigid_global_info.substep_dt[None]
+                            )
+                            qrot = gu.ti_rotvec_to_quat(ang, EPS)
+                            rot = gu.ti_transform_quat_by_quat(qrot, rot)
+                            pos = ti.Vector(
+                                [
+                                    rigid_global_info.qpos[q_start, i_b],
+                                    rigid_global_info.qpos[q_start + 1, i_b],
+                                    rigid_global_info.qpos[q_start + 2, i_b],
+                                ]
+                            )
+                            vel = ti.Vector(
+                                [
+                                    dofs_state.vel[dof_start, i_b],
+                                    dofs_state.vel[dof_start + 1, i_b],
+                                    dofs_state.vel[dof_start + 2, i_b],
+                                ]
+                            )
+                            pos = pos + vel * rigid_global_info.substep_dt[None]
+                            for j in ti.static(range(3)):
+                                rigid_global_info.qpos[q_start + j, i_b] = pos[j]
+                            for j in ti.static(range(4)):
+                                rigid_global_info.qpos[q_start + j + 3, i_b] = rot[j]
+                        elif joint_type == gs.JOINT_TYPE.FIXED:
+                            pass
+                        elif joint_type == gs.JOINT_TYPE.SPHERICAL:
+                            rot = ti.Vector(
+                                [
+                                    rigid_global_info.qpos[q_start + 0, i_b],
+                                    rigid_global_info.qpos[q_start + 1, i_b],
+                                    rigid_global_info.qpos[q_start + 2, i_b],
+                                    rigid_global_info.qpos[q_start + 3, i_b],
+                                ]
+                            )
+                            ang = (
+                                ti.Vector(
+                                    [
+                                        dofs_state.vel[dof_start + 3, i_b],
+                                        dofs_state.vel[dof_start + 4, i_b],
+                                        dofs_state.vel[dof_start + 5, i_b],
+                                    ]
+                                )
+                                * rigid_global_info.substep_dt[None]
+                            )
+                            qrot = gu.ti_rotvec_to_quat(ang, EPS)
+                            rot = gu.ti_transform_quat_by_quat(qrot, rot)
+                            for j in ti.static(range(4)):
+                                rigid_global_info.qpos[q_start + j, i_b] = rot[j]
+
+                        else:
+                            for j in range(q_end - q_start):
+                                rigid_global_info.qpos[q_start + j, i_b] = (
+                                    rigid_global_info.qpos[q_start + j, i_b]
+                                    + dofs_state.vel[dof_start + j, i_b] * rigid_global_info.substep_dt[None]
+                                )
+    else:
         ti.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
         for i_b in range(_B):
-            for i_l_ in range(rigid_global_info.n_awake_links[i_b]):
-                i_l = rigid_global_info.awake_links[i_l_, i_b]
-                I_l = [i_l, i_b] if ti.static(static_rigid_sim_config.batch_links_info) else i_l
+            is_valid = True
+            for i_d in range(n_dofs):
+                if ti.math.isnan(dofs_state.acc[i_d, i_b]):
+                    is_valid = False
 
-                for i_j in range(links_info.joint_start[I_l], links_info.joint_end[I_l]):
+            if is_valid:
+                for i_d in range(n_dofs):
+                    dofs_state.vel[i_d, i_b] = (
+                        dofs_state.vel[i_d, i_b] + dofs_state.acc[i_d, i_b] * rigid_global_info.substep_dt[None]
+                    )
+
+                for i_l in range(n_links):
+                    I_l = [i_l, i_b] if ti.static(static_rigid_sim_config.batch_links_info) else i_l
+                    if links_info.n_dofs[I_l] == 0:
+                        continue
+
+                    dof_start = links_info.dof_start[I_l]
+                    q_start = links_info.q_start[I_l]
+                    q_end = links_info.q_end[I_l]
+
+                    i_j = links_info.joint_start[I_l]
                     I_j = [i_j, i_b] if ti.static(static_rigid_sim_config.batch_joints_info) else i_j
-                    dof_start = joints_info.dof_start[I_j]
-                    q_start = joints_info.q_start[I_j]
-                    q_end = joints_info.q_end[I_j]
-
                     joint_type = joints_info.type[I_j]
 
                     if joint_type == gs.JOINT_TYPE.FREE:
-                        rot = ti.Vector(
-                            [
-                                rigid_global_info.qpos[q_start + 3, i_b],
-                                rigid_global_info.qpos[q_start + 4, i_b],
-                                rigid_global_info.qpos[q_start + 5, i_b],
-                                rigid_global_info.qpos[q_start + 6, i_b],
-                            ]
-                        )
-                        ang = (
-                            ti.Vector(
-                                [
-                                    dofs_state.vel[dof_start + 3, i_b],
-                                    dofs_state.vel[dof_start + 4, i_b],
-                                    dofs_state.vel[dof_start + 5, i_b],
-                                ]
-                            )
-                            * rigid_global_info.substep_dt[None]
-                        )
-                        qrot = gu.ti_rotvec_to_quat(ang, EPS)
-                        rot = gu.ti_transform_quat_by_quat(qrot, rot)
                         pos = ti.Vector(
                             [
                                 rigid_global_info.qpos[q_start, i_b],
@@ -5638,25 +5679,22 @@ def func_integrate(
                         pos = pos + vel * rigid_global_info.substep_dt[None]
                         for j in ti.static(range(3)):
                             rigid_global_info.qpos[q_start + j, i_b] = pos[j]
-                        for j in ti.static(range(4)):
-                            rigid_global_info.qpos[q_start + j + 3, i_b] = rot[j]
-                    elif joint_type == gs.JOINT_TYPE.FIXED:
-                        pass
-                    elif joint_type == gs.JOINT_TYPE.SPHERICAL:
+                    if joint_type == gs.JOINT_TYPE.SPHERICAL or joint_type == gs.JOINT_TYPE.FREE:
+                        rot_offset = 3 if joint_type == gs.JOINT_TYPE.FREE else 0
                         rot = ti.Vector(
                             [
-                                rigid_global_info.qpos[q_start + 0, i_b],
-                                rigid_global_info.qpos[q_start + 1, i_b],
-                                rigid_global_info.qpos[q_start + 2, i_b],
-                                rigid_global_info.qpos[q_start + 3, i_b],
+                                rigid_global_info.qpos[q_start + rot_offset + 0, i_b],
+                                rigid_global_info.qpos[q_start + rot_offset + 1, i_b],
+                                rigid_global_info.qpos[q_start + rot_offset + 2, i_b],
+                                rigid_global_info.qpos[q_start + rot_offset + 3, i_b],
                             ]
                         )
                         ang = (
                             ti.Vector(
                                 [
-                                    dofs_state.vel[dof_start + 3, i_b],
-                                    dofs_state.vel[dof_start + 4, i_b],
-                                    dofs_state.vel[dof_start + 5, i_b],
+                                    dofs_state.vel[dof_start + rot_offset + 0, i_b],
+                                    dofs_state.vel[dof_start + rot_offset + 1, i_b],
+                                    dofs_state.vel[dof_start + rot_offset + 2, i_b],
                                 ]
                             )
                             * rigid_global_info.substep_dt[None]
@@ -5664,84 +5702,13 @@ def func_integrate(
                         qrot = gu.ti_rotvec_to_quat(ang, EPS)
                         rot = gu.ti_transform_quat_by_quat(qrot, rot)
                         for j in ti.static(range(4)):
-                            rigid_global_info.qpos[q_start + j, i_b] = rot[j]
-
+                            rigid_global_info.qpos[q_start + j + rot_offset, i_b] = rot[j]
                     else:
                         for j in range(q_end - q_start):
                             rigid_global_info.qpos[q_start + j, i_b] = (
                                 rigid_global_info.qpos[q_start + j, i_b]
                                 + dofs_state.vel[dof_start + j, i_b] * rigid_global_info.substep_dt[None]
                             )
-
-    else:
-        ti.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
-        for i_d, i_b in ti.ndrange(n_dofs, _B):
-            dofs_state.vel[i_d, i_b] = (
-                dofs_state.vel[i_d, i_b] + dofs_state.acc[i_d, i_b] * rigid_global_info.substep_dt[None]
-            )
-
-        ti.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
-        for i_l, i_b in ti.ndrange(n_links, _B):
-            I_l = [i_l, i_b] if ti.static(static_rigid_sim_config.batch_links_info) else i_l
-            if links_info.n_dofs[I_l] == 0:
-                continue
-
-            dof_start = links_info.dof_start[I_l]
-            q_start = links_info.q_start[I_l]
-            q_end = links_info.q_end[I_l]
-
-            i_j = links_info.joint_start[I_l]
-            I_j = [i_j, i_b] if ti.static(static_rigid_sim_config.batch_joints_info) else i_j
-            joint_type = joints_info.type[I_j]
-
-            if joint_type == gs.JOINT_TYPE.FREE:
-                pos = ti.Vector(
-                    [
-                        rigid_global_info.qpos[q_start, i_b],
-                        rigid_global_info.qpos[q_start + 1, i_b],
-                        rigid_global_info.qpos[q_start + 2, i_b],
-                    ]
-                )
-                vel = ti.Vector(
-                    [
-                        dofs_state.vel[dof_start, i_b],
-                        dofs_state.vel[dof_start + 1, i_b],
-                        dofs_state.vel[dof_start + 2, i_b],
-                    ]
-                )
-                pos = pos + vel * rigid_global_info.substep_dt[None]
-                for j in ti.static(range(3)):
-                    rigid_global_info.qpos[q_start + j, i_b] = pos[j]
-            if joint_type == gs.JOINT_TYPE.SPHERICAL or joint_type == gs.JOINT_TYPE.FREE:
-                rot_offset = 3 if joint_type == gs.JOINT_TYPE.FREE else 0
-                rot = ti.Vector(
-                    [
-                        rigid_global_info.qpos[q_start + rot_offset + 0, i_b],
-                        rigid_global_info.qpos[q_start + rot_offset + 1, i_b],
-                        rigid_global_info.qpos[q_start + rot_offset + 2, i_b],
-                        rigid_global_info.qpos[q_start + rot_offset + 3, i_b],
-                    ]
-                )
-                ang = (
-                    ti.Vector(
-                        [
-                            dofs_state.vel[dof_start + rot_offset + 0, i_b],
-                            dofs_state.vel[dof_start + rot_offset + 1, i_b],
-                            dofs_state.vel[dof_start + rot_offset + 2, i_b],
-                        ]
-                    )
-                    * rigid_global_info.substep_dt[None]
-                )
-                qrot = gu.ti_rotvec_to_quat(ang, EPS)
-                rot = gu.ti_transform_quat_by_quat(qrot, rot)
-                for j in ti.static(range(4)):
-                    rigid_global_info.qpos[q_start + j + rot_offset, i_b] = rot[j]
-            else:
-                for j in range(q_end - q_start):
-                    rigid_global_info.qpos[q_start + j, i_b] = (
-                        rigid_global_info.qpos[q_start + j, i_b]
-                        + dofs_state.vel[dof_start + j, i_b] * rigid_global_info.substep_dt[None]
-                    )
 
 
 @ti.func
@@ -5872,11 +5839,11 @@ def kernel_update_vgeoms_render_T(
             vgeoms_render_T[(i_g, i_b, *J)] = ti.cast(geom_T[J], ti.float32)
 
 
-# FIXME: This kernel cannot use 'pure' because  'gs.Tensor' is currently not support by GsTaichi
-@ti.kernel(fastcache=False)
+@ti.kernel(fastcache=gs.use_fastcache)
 def kernel_get_state(
     qpos: ti.types.ndarray(),
     vel: ti.types.ndarray(),
+    acc: ti.types.ndarray(),
     links_pos: ti.types.ndarray(),
     links_quat: ti.types.ndarray(),
     i_pos_shift: ti.types.ndarray(),
@@ -5902,6 +5869,7 @@ def kernel_get_state(
     ti.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
     for i_d, i_b in ti.ndrange(n_dofs, _B):
         vel[i_b, i_d] = dofs_state.vel[i_d, i_b]
+        acc[i_b, i_d] = dofs_state.acc[i_d, i_b]
 
     ti.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
     for i_l, i_b in ti.ndrange(n_links, _B):
@@ -5917,11 +5885,11 @@ def kernel_get_state(
         friction_ratio[i_b, i_l] = geoms_state.friction_ratio[i_l, i_b]
 
 
-# FIXME: This kernel cannot use 'pure' because  'gs.Tensor' is currently not support by GsTaichi
-@ti.kernel(fastcache=False)
+@ti.kernel(fastcache=gs.use_fastcache)
 def kernel_set_state(
     qpos: ti.types.ndarray(),
     dofs_vel: ti.types.ndarray(),
+    dofs_acc: ti.types.ndarray(),
     links_pos: ti.types.ndarray(),
     links_quat: ti.types.ndarray(),
     i_pos_shift: ti.types.ndarray(),
@@ -5947,6 +5915,7 @@ def kernel_set_state(
     ti.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
     for i_d, i_b_ in ti.ndrange(n_dofs, envs_idx.shape[0]):
         dofs_state.vel[i_d, envs_idx[i_b_]] = dofs_vel[envs_idx[i_b_], i_d]
+        dofs_state.acc[i_d, envs_idx[i_b_]] = dofs_acc[envs_idx[i_b_], i_d]
         dofs_state.ctrl_force[i_d, envs_idx[i_b_]] = gs.ti_float(0.0)
         dofs_state.ctrl_mode[i_d, envs_idx[i_b_]] = gs.CTRL_MODE.FORCE
 
