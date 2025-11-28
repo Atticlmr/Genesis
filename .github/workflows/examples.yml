@@ -1,9 +1,9 @@
 name: Examples (CPU)
 
 on:
-  pull_request:
-    branches:
-      - main
+  # pull_request:
+  #   branches:
+  #     - main
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
