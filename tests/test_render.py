@@ -9,6 +9,7 @@ import numpy as np
 import pyglet
 import pytest
 import torch
+import OpenGL.error
 
 import genesis as gs
 import genesis.utils.geom as gu
@@ -316,7 +317,7 @@ def test_render_api_advanced(tmp_path, n_envs, show_viewer, png_snapshot, render
         show_viewer=False,
         show_FPS=False,
     )
-    plane = scene.add_entity(
+    scene.add_entity(
         morph=gs.morphs.Plane(),
         surface=gs.surfaces.Aluminium(
             ior=10.0,
@@ -389,11 +390,9 @@ def test_render_api_advanced(tmp_path, n_envs, show_viewer, png_snapshot, render
 
     # Attach cameras
     for i in range(0, len(cameras), 3):
-        cam_0, cam_1, cam_2 = cameras[i : (i + 3)]
-        R = np.eye(3)
-        trans = np.array([0.1, 0.0, 0.2])
-        cam_2.attach(robot.get_link("Head_upper"), gu.trans_R_to_T(trans, R))
-        cam_1.follow_entity(robot)
+        cameras[i + 1].follow_entity(robot)
+        pose_rel = gu.trans_R_to_T(np.array([0.1, 0.0, 0.2]), np.eye(3))
+        cameras[i + 2].attach(robot.get_link("Head_upper"), pose_rel)
 
     # Create image exporter
     exporter = FrameImageExporter(tmp_path)
@@ -991,7 +990,7 @@ def test_sensors_draw_debug(n_envs, renderer, png_snapshot):
 @pytest.mark.required
 @pytest.mark.parametrize("renderer_type", [RENDERER_TYPE.RASTERIZER])
 @pytest.mark.skipif(not IS_INTERACTIVE_VIEWER_AVAILABLE, reason="Interactive viewer not supported on this platform.")
-def test_interactive_viewer_key_press(tmp_path, monkeypatch, renderer, png_snapshot, show_viewer):
+def test_interactive_viewer_key_press(tmp_path, monkeypatch, renderer, png_snapshot):
     IMAGE_FILENAME = tmp_path / "screenshot.png"
 
     # Mock 'get_save_filename' to avoid poping up an interactive dialog
@@ -1071,6 +1070,7 @@ def test_interactive_viewer_key_press(tmp_path, monkeypatch, renderer, png_snaps
 @pytest.mark.required
 @pytest.mark.parametrize("renderer_type", [RENDERER_TYPE.RASTERIZER])
 @pytest.mark.skipif(not IS_INTERACTIVE_VIEWER_AVAILABLE, reason="Interactive viewer not supported on this platform.")
+@pytest.mark.xfail(sys.platform == "win32", raises=OpenGL.error.Error, reason="Invalid OpenGL context.")
 def test_interactive_viewer_disable_keyboard_shortcuts():
     """Test that keyboard shortcuts can be disabled in the interactive viewer."""
 

@@ -41,7 +41,7 @@ class ConstraintSolver:
             4 * rigid_solver.collider._collider_info.max_contact_pairs[None]
             + sum(joint.type in (gs.JOINT_TYPE.REVOLUTE, gs.JOINT_TYPE.PRISMATIC) for joint in self._solver.joints)
             + self._solver.n_dofs
-            + self._solver.n_equalities_candidate * 6
+            + self._solver.n_candidate_equalities_ * 6
         )
         self.len_constraints_ = max(1, self.len_constraints)
 
@@ -324,18 +324,17 @@ class ConstraintSolver:
 
         return weld_const_info
 
-    def add_weld_constraint(self, link1_idx, link2_idx, envs_idx=None, *, unsafe=False):
-        envs_idx = self._solver._scene._sanitize_envs_idx(envs_idx, unsafe=unsafe)
+    def add_weld_constraint(self, link1_idx, link2_idx, envs_idx=None):
+        envs_idx = self._solver._scene._sanitize_envs_idx(envs_idx)
         link1_idx, link2_idx = int(link1_idx), int(link2_idx)
 
-        if not unsafe:
-            assert link1_idx >= 0 and link2_idx >= 0
-            weld_const_info = self.get_weld_constraints(as_tensor=True, to_torch=True)
-            link_a = weld_const_info["link_a"]
-            link_b = weld_const_info["link_b"]
-            assert not (
-                ((link_a == link1_idx) | (link_b == link1_idx)) & ((link_a == link2_idx) | (link_b == link2_idx))
-            ).any()
+        assert link1_idx >= 0 and link2_idx >= 0
+        weld_const_info = self.get_weld_constraints(as_tensor=True, to_torch=True)
+        link_a = weld_const_info["link_a"]
+        link_b = weld_const_info["link_b"]
+        assert not (
+            ((link_a == link1_idx) | (link_b == link1_idx)) & ((link_a == link2_idx) | (link_b == link2_idx))
+        ).any()
 
         self._eq_const_info_cache.clear()
         overflow = kernel_add_weld_constraint(
@@ -351,12 +350,12 @@ class ConstraintSolver:
         if overflow:
             gs.logger.warning(
                 "Ignoring dynamically registered weld constraint to avoid exceeding max number of equality constraints"
-                f"({self.rigid_global_info.n_equalities_candidate.to_numpy()}). Please increase the value of "
+                f"({self.rigid_global_info.n_candidate_equalities.to_numpy()}). Please increase the value of "
                 "RigidSolver's option 'max_dynamic_constraints'."
             )
 
-    def delete_weld_constraint(self, link1_idx, link2_idx, envs_idx=None, *, unsafe=False):
-        envs_idx = self._solver._scene._sanitize_envs_idx(envs_idx, unsafe=unsafe)
+    def delete_weld_constraint(self, link1_idx, link2_idx, envs_idx=None):
+        envs_idx = self._solver._scene._sanitize_envs_idx(envs_idx)
         self._eq_const_info_cache.clear()
         kernel_delete_weld_constraint(
             int(link1_idx),
@@ -2013,6 +2012,7 @@ def func_update_gradient(
         rigid_solver.func_solve_mass_batched(
             constraint_state.grad,
             constraint_state.Mgrad,
+            array_class.PLACEHOLDER,
             i_b,
             entities_info=entities_info,
             rigid_global_info=rigid_global_info,
@@ -2190,7 +2190,7 @@ def kernel_add_weld_constraint(
     for i_b_ in ti.ndrange(envs_idx.shape[0]):
         i_b = envs_idx[i_b_]
         i_e = constraint_state.ti_n_equalities[i_b]
-        if i_e == rigid_global_info.n_equalities_candidate[None]:
+        if i_e == rigid_global_info.n_candidate_equalities[None]:
             overflow = True
         else:
             shared_pos = links_state.pos[link1_idx, i_b]
